@@ -1,7 +1,7 @@
 import os
-import sys
+import io
 import warnings
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional
 
 import numpy as np
 from PIL import Image
@@ -50,7 +50,6 @@ class Config:
     # Search
     DEFAULT_TOP_K = int(os.getenv("DEFAULT_TOP_K", "5"))
     RRF_K = int(os.getenv("RRF_K", "60"))
-    TEXT_WEIGHT = float(os.getenv("TEXT_WEIGHT", "0.6"))
 
     # Device
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -142,11 +141,7 @@ def load_llm() -> ChatOpenAI:
 
 
 def convert_to_sparse_csr(dense_array: np.ndarray, top_k: int = 256) -> csr_matrix:
-    """
-    Convert dense array to scipy CSR sparse matrix.
-
-    Keeps only top-K dimensions.
-    """
+    """Convert dense array to scipy CSR sparse matrix (top-K dims)."""
     top_indices = np.argsort(dense_array)[-top_k:]
     top_values = dense_array[top_indices]
 
@@ -158,63 +153,11 @@ def convert_to_sparse_csr(dense_array: np.ndarray, top_k: int = 256) -> csr_matr
     return sparse_matrix
 
 
-# =============================================================================
-# ENCODING / RETRIEVAL
-# =============================================================================
-def encode_text_query(
-    text: str,
-    backend: Dict,
-) -> Tuple[np.ndarray, Optional[csr_matrix]]:
-    """Encode text query with CLIP (dense) and SPLADE (sparse)."""
-    clip_model: SentenceTransformer = backend["clip_model"]
-    splade_model: Optional[SentenceTransformer] = backend.get("splade_model")
-
-    # Dense
-    dense = clip_model.encode([text], convert_to_numpy=True)
-    dense = dense / np.linalg.norm(dense)
-
-    # Sparse
-    sparse_csr = None
-    if splade_model is not None:
-        sparse_array = splade_model.encode([text], convert_to_numpy=True)[0]
-        sparse_csr = convert_to_sparse_csr(sparse_array, top_k=Config.SPLADE_TOP_K)
-
-    return dense[0], sparse_csr
-
-
-def encode_image_query(
-    image: Image.Image,
-    backend: Dict,
-) -> np.ndarray:
-    """Encode image query with CLIP."""
-    clip_model: SentenceTransformer = backend["clip_model"]
-    dense = clip_model.encode([image], convert_to_numpy=True)
-    dense = dense / np.linalg.norm(dense)
-    return dense[0]
-
-
-def encode_hybrid_query(
-    text: str,
-    image: Image.Image,
-    backend: Dict,
-    text_weight: float = None,
-) -> Tuple[np.ndarray, Optional[csr_matrix]]:
-    """Encode hybrid query (text + image) with weighted fusion."""
-    if text_weight is None:
-        text_weight = Config.TEXT_WEIGHT
-
-    text_dense, text_sparse = encode_text_query(text, backend)
-    image_dense = encode_image_query(image, backend)
-
-    fused_dense = text_weight * text_dense + (1 - text_weight) * image_dense
-    fused_dense = fused_dense / np.linalg.norm(fused_dense)
-
-    return fused_dense, text_sparse
-
-
 def reciprocal_rank_fusion(result_lists: List[List], k: int = None) -> List[Dict]:
     """
     Combine multiple result lists using Reciprocal Rank Fusion.
+
+    Uses Milvus primary key (hit.id) as the unique key for fusion.
     """
     if k is None:
         k = Config.RRF_K
@@ -223,18 +166,18 @@ def reciprocal_rank_fusion(result_lists: List[List], k: int = None) -> List[Dict
 
     for result_list in result_lists:
         for rank, hit in enumerate(result_list):
-            product_id = hit.entity.get("product_id")
+            unique_id = str(hit.id)
             rrf_score = 1.0 / (k + rank + 1)
 
-            if product_id not in combined_scores:
-                combined_scores[product_id] = {
+            if unique_id not in combined_scores:
+                combined_scores[unique_id] = {
                     "entity": hit.entity,
                     "score": 0.0,
                     "sources": [],
                 }
 
-            combined_scores[product_id]["score"] += rrf_score
-            combined_scores[product_id]["sources"].append(
+            combined_scores[unique_id]["score"] += rrf_score
+            combined_scores[unique_id]["sources"].append(
                 {"rank": rank + 1, "distance": hit.distance}
             )
 
@@ -246,15 +189,25 @@ def reciprocal_rank_fusion(result_lists: List[List], k: int = None) -> List[Dict
     return sorted_results
 
 
+# =============================================================================
+# RETRIEVAL (IMAGE-ONLY WHEN IMAGE IS USED)
+# =============================================================================
 def retrieve_products(
     backend: Dict,
     query_text: Optional[str] = None,
     query_image: Optional[Image.Image] = None,
     top_k: int = None,
-    text_weight: float = None,
 ) -> List[Dict]:
     """
-    Retrieve products using hybrid search (CLIP + SPLADE) over Milvus.
+    Retrieve products from Milvus.
+
+    BEHAVIOR:
+    - If query_image is provided and query_text is None:
+        -> IMAGE-ONLY retrieval (image_dense_embedding).
+    - If query_text is provided and query_image is None:
+        -> TEXT-ONLY retrieval (text_dense_embedding + optional SPLADE).
+    - If both are provided:
+        -> Retrieval is still image-only; text is used only for LLM generation.
     """
     if not query_text and not query_image:
         raise ValueError("Must provide either query_text or query_image")
@@ -263,67 +216,54 @@ def retrieve_products(
         top_k = Config.DEFAULT_TOP_K
 
     collection: Collection = backend["collection"]
-
-    # Encode query
-    if query_text and query_image:
-        dense_emb, sparse_csr = encode_hybrid_query(
-            text=query_text,
-            image=query_image,
-            backend=backend,
-            text_weight=text_weight,
-        )
-    elif query_text:
-        dense_emb, sparse_csr = encode_text_query(query_text, backend)
-    else:
-        dense_emb = encode_image_query(query_image, backend)
-        sparse_csr = None
-
-    # Search all vector fields
-    search_params = {"metric_type": "COSINE", "params": {"ef": 100}}
-    result_lists = []
-
-    # text_dense_embedding
-    text_dense_results = collection.search(
-        data=[dense_emb.tolist()],
-        anns_field="text_dense_embedding",
-        param=search_params,
-        limit=top_k * 2,
-        output_fields=[
-            "product_id",
-            "product_name",
-            "image_url",
-            "selling_price",
-            "clip_text",
-            "about_product",
-        ],
-    )[0]
-    result_lists.append(text_dense_results)
-
-    # image_dense_embedding
-    image_dense_results = collection.search(
-        data=[dense_emb.tolist()],
-        anns_field="image_dense_embedding",
-        param=search_params,
-        limit=top_k * 2,
-        output_fields=[
-            "product_id",
-            "product_name",
-            "image_url",
-            "selling_price",
-            "clip_text",
-            "about_product",
-        ],
-    )[0]
-    result_lists.append(image_dense_results)
-
-    # text_sparse_embedding (if SPLADE available)
+    clip_model: SentenceTransformer = backend["clip_model"]
     splade_model: Optional[SentenceTransformer] = backend.get("splade_model")
-    if sparse_csr is not None and splade_model is not None:
-        sparse_search_params = {"metric_type": "IP", "params": {}}
-        sparse_results = collection.search(
-            data=[sparse_csr],
-            anns_field="text_sparse_embedding",
-            param=sparse_search_params,
+
+    search_params = {"metric_type": "COSINE", "params": {"ef": 100}}
+
+    # CASE 1: IMAGE-ONLY RETRIEVAL (visual search)
+    if query_image is not None and query_text is None:
+        image_dense = clip_model.encode([query_image], convert_to_numpy=True)
+        image_dense = image_dense / np.linalg.norm(image_dense)
+        image_dense = image_dense[0]
+
+        image_results = collection.search(
+            data=[image_dense.tolist()],
+            anns_field="image_dense_embedding",
+            param=search_params,
+            limit=top_k,
+            output_fields=[
+                "product_id",
+                "product_name",
+                "image_url",
+                "selling_price",
+                "clip_text",
+                "about_product",
+            ],
+        )[0]
+
+        return [
+            {
+                "entity": hit.entity,
+                "score": 1.0 / (rank + 1),
+                "sources": [{"rank": rank + 1, "distance": hit.distance}],
+            }
+            for rank, hit in enumerate(image_results)
+        ]
+
+    # CASE 2: TEXT-ONLY RETRIEVAL
+    if query_text and query_image is None:
+        result_lists = []
+
+        # CLIP text embedding
+        text_dense = clip_model.encode([query_text], convert_to_numpy=True)
+        text_dense = text_dense / np.linalg.norm(text_dense)
+        text_dense = text_dense[0]
+
+        text_results = collection.search(
+            data=[text_dense.tolist()],
+            anns_field="text_dense_embedding",
+            param=search_params,
             limit=top_k * 2,
             output_fields=[
                 "product_id",
@@ -334,10 +274,76 @@ def retrieve_products(
                 "about_product",
             ],
         )[0]
-        result_lists.append(sparse_results)
+        result_lists.append(text_results)
 
-    combined_results = reciprocal_rank_fusion(result_lists)
-    return combined_results[:top_k]
+        # SPLADE sparse (optional)
+        if splade_model is not None:
+            sparse_array = splade_model.encode([query_text], convert_to_numpy=True)[0]
+            sparse_csr = convert_to_sparse_csr(sparse_array, top_k=Config.SPLADE_TOP_K)
+
+            sparse_search_params = {"metric_type": "IP", "params": {}}
+            sparse_results = collection.search(
+                data=[sparse_csr],
+                anns_field="text_sparse_embedding",
+                param=sparse_search_params,
+                limit=top_k * 2,
+                output_fields=[
+                    "product_id",
+                    "product_name",
+                    "image_url",
+                    "selling_price",
+                    "clip_text",
+                    "about_product",
+                ],
+            )[0]
+            result_lists.append(sparse_results)
+
+        if not result_lists:
+            return []
+
+        if len(result_lists) == 1:
+            single_list = result_lists[0]
+            return [
+                {
+                    "entity": hit.entity,
+                    "score": 1.0 / (rank + 1),
+                    "sources": [{"rank": rank + 1, "distance": hit.distance}],
+                }
+                for rank, hit in enumerate(single_list)
+            ][:top_k]
+
+        combined_results = reciprocal_rank_fusion(result_lists)
+        return combined_results[:top_k]
+
+    # CASE 3: HYBRID TEXT + IMAGE
+    # Retrieval is still image-only; text is used only for LLM generation.
+    image_dense = clip_model.encode([query_image], convert_to_numpy=True)
+    image_dense = image_dense / np.linalg.norm(image_dense)
+    image_dense = image_dense[0]
+
+    image_results = collection.search(
+        data=[image_dense.tolist()],
+        anns_field="image_dense_embedding",
+        param=search_params,
+        limit=top_k,
+        output_fields=[
+            "product_id",
+            "product_name",
+            "image_url",
+            "selling_price",
+            "clip_text",
+            "about_product",
+        ],
+    )[0]
+
+    return [
+        {
+            "entity": hit.entity,
+            "score": 1.0 / (rank + 1),
+            "sources": [{"rank": rank + 1, "distance": hit.distance}],
+        }
+        for rank, hit in enumerate(image_results)
+    ]
 
 
 # =============================================================================
@@ -463,6 +469,9 @@ def rag_query(
 ) -> RAGResponse:
     """
     Complete RAG pipeline: retrieve + generate.
+
+    Note: when query_image is provided, retrieval is image-driven
+    (text is used only for generation).
     """
     if not query_text and not query_image:
         raise ValueError("Must provide either query_text or query_image")
@@ -473,7 +482,7 @@ def rag_query(
     if top_k is None:
         top_k = Config.DEFAULT_TOP_K
 
-    # Determine query type
+    # Determine query type (for metadata)
     if query_text and query_image:
         query_type = "hybrid"
     elif query_text:
@@ -481,9 +490,10 @@ def rag_query(
     else:
         query_type = "image"
 
+    # Retrieval logic is fully handled inside retrieve_products
     products = retrieve_products(
         backend=backend,
-        query_text=query_text,
+        query_text=query_text if query_image is None else None,  # image takes precedence
         query_image=query_image,
         top_k=top_k,
     )
@@ -513,9 +523,7 @@ st.set_page_config(
 
 @st.cache_resource(show_spinner=True)
 def init_backend() -> Dict:
-    """
-    Initialize and cache backend resources (Milvus, models, LLM).
-    """
+    """Initialize and cache backend resources (Milvus, models, LLM)."""
     Config.validate()
     Config.print_config()
 
@@ -533,20 +541,183 @@ def init_backend() -> Dict:
     return backend
 
 
+def render_product_card(entity: Dict, score: float):
+    """Render a product in an Amazon-like card."""
+    name = entity.get("product_name", "Unnamed product")
+    price = entity.get("selling_price")
+    img_url = entity.get("image_url")
+    desc = entity.get("about_product", "")
+    desc_snip = (str(desc)[:130] + "…") if desc else ""
+
+    st.markdown(
+        """
+        <div class="product-card">
+            <div class="product-img-wrapper">
+        """,
+        unsafe_allow_html=True,
+    )
+    if img_url:
+        # Explicit width (no use_column_width)
+        st.image(img_url, width=180)
+    else:
+        st.markdown(
+            '<div class="product-placeholder">No image</div>',
+            unsafe_allow_html=True,
+        )
+    st.markdown(
+        f"""
+            </div>
+            <div class="product-info">
+                <div class="product-title">{name}</div>
+                <div class="product-price">
+                    {f"${price:.2f}" if isinstance(price, (int, float)) else (price or "")}
+                </div>
+                <div class="product-desc">{desc_snip}</div>
+                <div class="product-meta">Relevance score: {score:.4f}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def main():
     backend = init_backend()
 
-    st.title("🛒 Product Chatbot (Hybrid RAG on Milvus)")
-    st.write(
-        "Ask questions about products using **text**, optionally upload a **product image**, "
-        "and get an answer that combines retrieval from Milvus/Zilliz and LLM generation."
+    # --- Amazon-like CSS theme ---
+    st.markdown(
+        """
+        <style>
+        .stApp {
+            background-color: #f3f3f3;
+        }
+        .main-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            padding-bottom: 2rem;
+        }
+        .amazon-header {
+            background-color: #131921;
+            color: #ffffff;
+            padding: 0.5rem 1.5rem;
+            margin: -1rem -1.5rem 1rem -1.5rem;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+        .amazon-logo {
+            font-weight: 700;
+            font-size: 1.3rem;
+            letter-spacing: 0.03em;
+            color: #ff9900;
+        }
+        .amazon-tagline {
+            font-size: 0.9rem;
+            opacity: 0.85;
+        }
+        .left-panel {
+            background-color: #ffffff;         /* chat section now white */
+            border-radius: 8px;
+            padding: 0.8rem 0.9rem 1.2rem 0.9rem;
+            box-shadow: 0 1px 3px rgba(15,17,17,0.15);
+            margin-bottom: 1rem;
+        }
+        .chat-card {
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 0.9rem 1.1rem;
+            margin-bottom: 0.6rem;
+            box-shadow: 0 1px 3px rgba(15,17,17,0.1);
+        }
+        .assistant-bubble {
+            border-left: 3px solid #ffa41c;
+        }
+        .user-bubble {
+            border-left: 3px solid #007185;
+        }
+        .product-panel-title {
+            font-weight: 600;
+            margin-bottom: 0.4rem;
+        }
+        .right-panel {
+            background-color: #ffffff; /* entire right side white */
+            border-radius: 8px;
+            padding: 0.8rem 0.8rem 1rem 0.8rem;
+            box-shadow: 0 1px 3px rgba(15,17,17,0.15);
+        }
+        .product-card {
+            background-color: #ffffff;
+            border-radius: 8px;
+            padding: 0.5rem;
+            margin-bottom: 0.6rem;
+            box-shadow: 0 1px 3px rgba(15,17,17,0.12);
+        }
+        .product-img-wrapper {
+            border-bottom: 1px solid #f0f0f0;
+            margin-bottom: 0.35rem;
+            text-align: center;
+        }
+        .product-placeholder {
+            font-size: 0.8rem;
+            color: #555;
+            padding: 1rem 0;
+        }
+        .product-info {
+            font-size: 0.8rem;
+        }
+        .product-title {
+            font-weight: 600;
+            margin-bottom: 0.2rem;
+            color: #007185;
+        }
+        .product-price {
+            color: #b12704;
+            font-weight: 600;
+            margin-bottom: 0.25rem;
+        }
+        .product-desc {
+            font-size: 0.8rem;
+            margin-bottom: 0.2rem;
+        }
+        .product-meta {
+            font-size: 0.7rem;
+            color: #555;
+        }
+        .stButton > button {
+            background-color: #ffa41c;
+            color: #111111;
+            border-radius: 999px;
+            border: 1px solid #fcd200;
+            padding: 0.25rem 0.9rem;
+            font-weight: 500;
+        }
+        .stButton > button:hover {
+            background-color: #f7a50c;
+            border-color: #f0c14b;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
+
+    # top "Amazon" header
+    st.markdown(
+        """
+        <div class="amazon-header">
+            <div class="amazon-logo">store.chat</div>
+            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown('<div class="main-container">', unsafe_allow_html=True)
 
     # Sidebar
     with st.sidebar:
         st.header("Settings")
         top_k = st.slider(
-            "Number of products to retrieve",
+            "Results per query",
             min_value=1,
             max_value=10,
             value=5,
@@ -559,115 +730,175 @@ def main():
         )
         return_mode = "full" if mode.startswith("full") else "retrieval_only"
 
-        st.markdown("### Backend info")
+        if st.button("🧹 Start new chat"):
+            st.session_state["messages"] = []
+            st.session_state["last_products"] = None
+            # FIX: use st.rerun() instead of deprecated experimental_rerun
+            st.rerun()
+
+        st.markdown("### Backend")
         st.write(f"Collection: `{Config.COLLECTION_NAME}`")
         st.write(f"Device: `{Config.DEVICE}`")
         st.write(f"LLM: `{Config.LLM_MODEL}`")
 
-    # Chat history
+    # State
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
+    if "last_products" not in st.session_state:
+        st.session_state["last_products"] = None
 
-    for msg in st.session_state["messages"]:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
+    # Layout: chat (left) + product results (right)
+    col_main, col_right = st.columns([2.1, 1.2])
 
-    # Input widgets
-    uploaded_file = st.file_uploader(
-        "Optional: upload a product image",
-        type=["png", "jpg", "jpeg"],
-    )
+    # ------------------ LEFT: CHAT AREA ------------------
+    with col_main:
+        st.markdown('<div class="left-panel">', unsafe_allow_html=True)
 
-    user_input = st.chat_input(
-        "Ask a question about a product (you can also say 'show me a picture of ...')"
-    )
+        st.subheader("Chat with your product assistant")
 
-    if user_input:
-        # Show user message
-        with st.chat_message("user"):
-            st.markdown(user_input)
-            if uploaded_file is not None:
-                st.image(
-                    uploaded_file,
-                    caption="Uploaded image",
-                    use_container_width=True,
+        # Show history (wrapped in card look)
+        for msg in st.session_state["messages"]:
+            role = msg["role"]
+            css_class = "assistant-bubble" if role == "assistant" else "user-bubble"
+            with st.chat_message(role):
+                st.markdown(
+                    f'<div class="chat-card {css_class}">{msg["content"]}</div>',
+                    unsafe_allow_html=True,
                 )
 
-        st.session_state["messages"].append({"role": "user", "content": user_input})
-
-        # Convert uploaded file to PIL image
-        query_image = None
-        if uploaded_file is not None:
-            query_image = Image.open(uploaded_file).convert("RGB")
-
-        # RAG pipeline
-        try:
-            response = rag_query(
-                backend=backend,
-                query_text=user_input.strip() or None,
-                query_image=query_image,
-                top_k=top_k,
-                return_mode=return_mode,
-            )
-        except ValueError as e:
-            with st.chat_message("assistant"):
-                st.error(str(e))
-            st.session_state["messages"].append(
-                {"role": "assistant", "content": f"Error: {e}"}
-            )
-            return
-
-        # Assistant message
-        with st.chat_message("assistant"):
-            if response.answer:
-                st.markdown(response.answer)
-                answer_text_for_history = response.answer
-            else:
-                if not response.products:
-                    answer_text_for_history = (
-                        "I couldn't find any matching products for your query."
-                    )
-                    st.markdown(answer_text_for_history)
-                else:
-                    answer_text_for_history = (
-                        "I retrieved some products matching your query (generation is disabled)."
-                    )
-                    st.markdown(answer_text_for_history)
-
-            # Main product image (single image to mirror your sample Q&A)
-            if response.products:
-                main_product = response.products[0]
-                entity = main_product["entity"]
-                img_url = entity.get("image_url")
-                name = entity.get("product_name", "Product image")
-
-                if img_url:
-                    st.markdown("#### Product image")
-                    st.image(
-                        img_url,
-                        caption=name,
-                        use_container_width=True,
-                    )
-
-            # Debug view of retrieved products
-            if response.products:
-                with st.expander("Retrieved products (debug view)"):
-                    for i, p in enumerate(response.products, start=1):
-                        e = p["entity"]
-                        st.markdown(
-                            f"**{i}. {e.get('product_name')}**  "
-                            f"(Price: {e.get('selling_price')}, Score: {p['score']:.4f})"
-                        )
-                        if e.get("about_product"):
-                            st.markdown(
-                                f"<small>{str(e['about_product'])[:200]}...</small>",
-                                unsafe_allow_html=True,
-                            )
-                        st.markdown("---")
-
-        st.session_state["messages"].append(
-            {"role": "assistant", "content": answer_text_for_history}
+        # Inputs
+        uploaded_file = st.file_uploader(
+            "Upload a product image (optional)",
+            type=["png", "jpg", "jpeg"],
+            key="image_uploader",
         )
+
+        use_image = st.checkbox(
+            "Use uploaded image for this question",
+            value=(uploaded_file is not None),
+            help="Uncheck to ignore the image and run a text-only search.",
+        )
+
+        user_input = st.chat_input(
+            "Ask about a product (e.g., 'What is this product and how do I use it?')"
+        )
+
+        if user_input:
+            # User message
+            with st.chat_message("user"):
+                content_html = f'<div class="chat-card user-bubble">{user_input}</div>'
+                st.markdown(content_html, unsafe_allow_html=True)
+                if uploaded_file is not None and use_image:
+                    st.image(
+                        uploaded_file,
+                        caption="Uploaded image",
+                        width=220,
+                    )
+
+            st.session_state["messages"].append(
+                {"role": "user", "content": user_input}
+            )
+
+            # Prepare image
+            query_image = None
+            if uploaded_file is not None and use_image:
+                image_bytes = uploaded_file.getvalue()
+                query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+            # RAG pipeline
+            try:
+                response = rag_query(
+                    backend=backend,
+                    query_text=user_input.strip() or None,
+                    query_image=query_image,
+                    top_k=top_k,
+                    return_mode=return_mode,
+                )
+            except ValueError as e:
+                with st.chat_message("assistant"):
+                    st.error(str(e))
+                st.session_state["messages"].append(
+                    {"role": "assistant", "content": f"Error: {e}"}
+                )
+                st.markdown("</div>", unsafe_allow_html=True)  # close left-panel
+                st.markdown("</div>", unsafe_allow_html=True)  # close main-container
+                return
+
+            # Assistant message
+            with st.chat_message("assistant"):
+                if response.answer:
+                    ans_html = (
+                        f'<div class="chat-card assistant-bubble">{response.answer}</div>'
+                    )
+                    st.markdown(ans_html, unsafe_allow_html=True)
+                    answer_text_for_history = response.answer
+                else:
+                    if not response.products:
+                        answer_text_for_history = (
+                            "I couldn't find any matching products for your query."
+                        )
+                    else:
+                        answer_text_for_history = (
+                            "I retrieved some products matching your query (generation is disabled)."
+                        )
+                    ans_html = (
+                        f'<div class="chat-card assistant-bubble">{answer_text_for_history}</div>'
+                    )
+                    st.markdown(ans_html, unsafe_allow_html=True)
+
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": answer_text_for_history}
+            )
+
+            # Save last products for the right panel
+            st.session_state["last_products"] = response.products
+
+        st.markdown("</div>", unsafe_allow_html=True)  # close left-panel
+
+    # ------------------ RIGHT: PRODUCT PANEL ------------------
+    with col_right:
+        st.markdown('<div class="right-panel">', unsafe_allow_html=True)
+
+        st.subheader("Matching products")
+
+        products = st.session_state.get("last_products") or []
+        if not products:
+            st.markdown(
+                "<div class='chat-card'>No products yet. Ask a question or upload an image to see matches here.</div>",
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                "<div class='product-panel-title'>Top results</div>",
+                unsafe_allow_html=True,
+            )
+            # Show up to 4 product cards
+            for p in products[:4]:
+                render_product_card(p["entity"], p["score"])
+
+            # Optional debug view
+            with st.expander("Debug: raw product list"):
+                for i, p in enumerate(products, start=1):
+                    e = p["entity"]
+                    st.markdown(
+                        f"**{i}. {e.get('product_name')}**  "
+                        f"(Price: {e.get('selling_price')}, Score: {p['score']:.4f})"
+                    )
+                    st.markdown(
+                        f"<small>product_id: {e.get('product_id')} | "
+                        f"image_url: {e.get('image_url')}</small>",
+                        unsafe_allow_html=True,
+                    )
+                    if e.get("about_product"):
+                        st.markdown(
+                            f"<small>{str(e['about_product'])[:200]}...</small>",
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown("---")
+
+        st.markdown("</div>", unsafe_allow_html=True)  # close right-panel
+
+    st.markdown("</div>", unsafe_allow_html=True)  # close main-container
 
 
 if __name__ == "__main__":
