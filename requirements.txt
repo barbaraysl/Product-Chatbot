@@ -1,0 +1,11 @@
+streamlit
+sentence-transformers
+pymilvus
+scipy
+langchain-openai
+openai
+torch
+torchvision
+torchaudio
+Pillow
+numpy
