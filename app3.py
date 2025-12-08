@@ -696,8 +696,8 @@ def main():
     st.markdown(
         """
         <div class="amazon-header">
-            <div class="amazon-logo">store.chat</div>
-            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
+            <div class="amazon-logo">Store Chatbot</div>
+            <div class="amazon-tagline">-Product Q&A assistant powered by hybrid search</div>
         </div>
         """,
         unsafe_allow_html=True,
