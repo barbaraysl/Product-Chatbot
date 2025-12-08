@@ -833,7 +833,7 @@ def main():
     with col_right:
         st.markdown('<div class="right-panel">', unsafe_allow_html=True)
 
-        st.subheader("Recommended Products Ranked by Relevance")
+        st.subheader("Recommended Products")
 
         products = st.session_state.get("last_products") or []
         if not products:
@@ -875,3 +875,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
