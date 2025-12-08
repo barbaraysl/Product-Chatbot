@@ -8,7 +8,7 @@ from PIL import Image
 import torch
 from sentence_transformers import SentenceTransformer
 from scipy.sparse import csr_matrix
-from pymilvus import connections, Collection
+from pymilvus import connections, Collection, MilvusException
 
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -84,27 +84,36 @@ class Config:
 # =============================================================================
 def connect_to_milvus() -> Collection:
     """Connect to Milvus / Zilliz and return collection."""
-    if Config.MILVUS_URI:
-        # Zilliz Cloud
-        connections.connect(
-            alias="default",
-            uri=Config.MILVUS_URI,
-            token=Config.MILVUS_TOKEN,
-        )
-    else:
-        # Local Milvus
-        connections.connect(
-            alias="default",
-            host=Config.MILVUS_HOST,
-            port=Config.MILVUS_PORT,
-        )
+    try:
+        if Config.MILVUS_URI:
+            connections.connect(
+                alias="default",
+                uri=Config.MILVUS_URI,
+                token=Config.MILVUS_TOKEN,
+            )
+        else:
+            connections.connect(
+                alias="default",
+                host=Config.MILVUS_HOST,
+                port=Config.MILVUS_PORT,
+            )
 
-    collection = Collection(Config.COLLECTION_NAME)
-    collection.load()
+        collection = Collection(Config.COLLECTION_NAME)
+        collection.load()
 
-    print(f"✓ Connected to Milvus collection: {Config.COLLECTION_NAME}")
-    print(f"✓ Collection entities: {collection.num_entities}")
-    return collection
+        print(f"✓ Connected to Milvus collection: {Config.COLLECTION_NAME}")
+        print(f"✓ Collection entities: {collection.num_entities}")
+        return collection
+
+    except MilvusException as e:
+        raise RuntimeError(
+            "❌ Failed to connect to Milvus.\n\n"
+            "Please check:\n"
+            "- MILVUS_URI and MILVUS_TOKEN (or MILVUS_HOST/MILVUS_PORT)\n"
+            "- Zilliz cluster is running\n"
+            "- Network/firewall allows outbound HTTPS to Zilliz\n\n"
+            f"Details from Milvus: {e}"
+        )
 
 
 def load_clip_model() -> SentenceTransformer:
@@ -190,7 +199,7 @@ def reciprocal_rank_fusion(result_lists: List[List], k: int = None) -> List[Dict
 
 
 # =============================================================================
-# RETRIEVAL (IMAGE-ONLY WHEN IMAGE IS USED)
+# RETRIEVAL
 # =============================================================================
 def retrieve_products(
     backend: Dict,
@@ -201,13 +210,9 @@ def retrieve_products(
     """
     Retrieve products from Milvus.
 
-    BEHAVIOR:
-    - If query_image is provided and query_text is None:
-        -> IMAGE-ONLY retrieval (image_dense_embedding).
-    - If query_text is provided and query_image is None:
-        -> TEXT-ONLY retrieval (text_dense_embedding + optional SPLADE).
-    - If both are provided:
-        -> Retrieval is still image-only; text is used only for LLM generation.
+    - Image provided (no text): image-only retrieval (image_dense_embedding).
+    - Text provided (no image): text-only retrieval (text_dense_embedding + SPLADE).
+    - Both: retrieval uses image; text is only for LLM generation.
     """
     if not query_text and not query_image:
         raise ValueError("Must provide either query_text or query_image")
@@ -221,7 +226,7 @@ def retrieve_products(
 
     search_params = {"metric_type": "COSINE", "params": {"ef": 100}}
 
-    # CASE 1: IMAGE-ONLY RETRIEVAL (visual search)
+    # CASE 1: IMAGE-ONLY
     if query_image is not None and query_text is None:
         image_dense = clip_model.encode([query_image], convert_to_numpy=True)
         image_dense = image_dense / np.linalg.norm(image_dense)
@@ -251,11 +256,10 @@ def retrieve_products(
             for rank, hit in enumerate(image_results)
         ]
 
-    # CASE 2: TEXT-ONLY RETRIEVAL
+    # CASE 2: TEXT-ONLY
     if query_text and query_image is None:
         result_lists = []
 
-        # CLIP text embedding
         text_dense = clip_model.encode([query_text], convert_to_numpy=True)
         text_dense = text_dense / np.linalg.norm(text_dense)
         text_dense = text_dense[0]
@@ -276,7 +280,6 @@ def retrieve_products(
         )[0]
         result_lists.append(text_results)
 
-        # SPLADE sparse (optional)
         if splade_model is not None:
             sparse_array = splade_model.encode([query_text], convert_to_numpy=True)[0]
             sparse_csr = convert_to_sparse_csr(sparse_array, top_k=Config.SPLADE_TOP_K)
@@ -315,8 +318,7 @@ def retrieve_products(
         combined_results = reciprocal_rank_fusion(result_lists)
         return combined_results[:top_k]
 
-    # CASE 3: HYBRID TEXT + IMAGE
-    # Retrieval is still image-only; text is used only for LLM generation.
+    # CASE 3: HYBRID (TEXT + IMAGE) → image-driven retrieval
     image_dense = clip_model.encode([query_image], convert_to_numpy=True)
     image_dense = image_dense / np.linalg.norm(image_dense)
     image_dense = image_dense[0]
@@ -467,12 +469,7 @@ def rag_query(
     top_k: int = None,
     return_mode: str = "full",
 ) -> RAGResponse:
-    """
-    Complete RAG pipeline: retrieve + generate.
-
-    Note: when query_image is provided, retrieval is image-driven
-    (text is used only for generation).
-    """
+    """Complete RAG pipeline: retrieve + generate."""
     if not query_text and not query_image:
         raise ValueError("Must provide either query_text or query_image")
 
@@ -482,7 +479,6 @@ def rag_query(
     if top_k is None:
         top_k = Config.DEFAULT_TOP_K
 
-    # Determine query type (for metadata)
     if query_text and query_image:
         query_type = "hybrid"
     elif query_text:
@@ -490,10 +486,9 @@ def rag_query(
     else:
         query_type = "image"
 
-    # Retrieval logic is fully handled inside retrieve_products
     products = retrieve_products(
         backend=backend,
-        query_text=query_text if query_image is None else None,  # image takes precedence
+        query_text=query_text if query_image is None else None,
         query_image=query_image,
         top_k=top_k,
     )
@@ -527,7 +522,12 @@ def init_backend() -> Dict:
     Config.validate()
     Config.print_config()
 
-    collection = connect_to_milvus()
+    try:
+        collection = connect_to_milvus()
+    except RuntimeError as e:
+        st.error(str(e))
+        st.stop()
+
     clip_model = load_clip_model()
     splade_model = load_splade_model()
     llm = load_llm()
@@ -583,12 +583,12 @@ def render_product_card(entity: Dict, score: float):
 def main():
     backend = init_backend()
 
-    # --- CSS theme (flattened: all white background, no visible top bars) ---
+    # --- CSS theme ---
     st.markdown(
         """
         <style>
         .stApp {
-            background-color: #ffffff;  /* whole app white */
+            background-color: #ffffff;
         }
         .main-container {
             max-width: 1200px;
@@ -614,7 +614,6 @@ def main():
             font-size: 0.9rem;
             opacity: 0.85;
         }
-        /* make panel wrappers transparent so they don't show as bars */
         .left-panel, .right-panel {
             background-color: transparent;
             border-radius: 0;
@@ -694,12 +693,11 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # top header
     st.markdown(
         """
         <div class="amazon-header">
-            <div class="amazon-logo">Product Chatbot</div>
-            <div class="amazon-tagline">-Q&A assistant powered by hybrid search</div>
+            <div class="amazon-logo">store.chat</div>
+            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -743,13 +741,12 @@ def main():
     # Layout: chat (left) + product results (right)
     col_main, col_right = st.columns([2.1, 1.2])
 
-    # ------------------ LEFT: CHAT AREA ------------------
+    # LEFT: CHAT
     with col_main:
         st.markdown('<div class="left-panel">', unsafe_allow_html=True)
 
-        st.subheader("Chat with your Product Assistant")
+        st.subheader("Chat with your product assistant")
 
-        # Show history
         for msg in st.session_state["messages"]:
             role = msg["role"]
             css_class = "assistant-bubble" if role == "assistant" else "user-bubble"
@@ -759,7 +756,6 @@ def main():
                     unsafe_allow_html=True,
                 )
 
-        # Inputs
         uploaded_file = st.file_uploader(
             "Upload a product image (optional)",
             type=["png", "jpg", "jpeg"],
@@ -777,28 +773,21 @@ def main():
         )
 
         if user_input:
-            # User message
             with st.chat_message("user"):
                 content_html = f'<div class="chat-card user-bubble">{user_input}</div>'
                 st.markdown(content_html, unsafe_allow_html=True)
                 if uploaded_file is not None and use_image:
-                    st.image(
-                        uploaded_file,
-                        caption="Uploaded image",
-                        width=220,
-                    )
+                    st.image(uploaded_file, caption="Uploaded image", width=220)
 
             st.session_state["messages"].append(
                 {"role": "user", "content": user_input}
             )
 
-            # Prepare image
             query_image = None
             if uploaded_file is not None and use_image:
                 image_bytes = uploaded_file.getvalue()
                 query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
-            # RAG pipeline
             try:
                 response = rag_query(
                     backend=backend,
@@ -813,11 +802,10 @@ def main():
                 st.session_state["messages"].append(
                     {"role": "assistant", "content": f"Error: {e}"}
                 )
-                st.markdown("</div>", unsafe_allow_html=True)  # left-panel
-                st.markdown("</div>", unsafe_allow_html=True)  # main-container
+                st.markdown("</div>", unsafe_allow_html=True)
+                st.markdown("</div>", unsafe_allow_html=True)
                 return
 
-            # Assistant message
             with st.chat_message("assistant"):
                 if response.answer:
                     ans_html = (
@@ -842,13 +830,11 @@ def main():
             st.session_state["messages"].append(
                 {"role": "assistant", "content": answer_text_for_history}
             )
-
-            # Save last products for the right panel
             st.session_state["last_products"] = response.products
 
-        st.markdown("</div>", unsafe_allow_html=True)  # left-panel
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # ------------------ RIGHT: PRODUCT PANEL ------------------
+    # RIGHT: PRODUCTS
     with col_right:
         st.markdown('<div class="right-panel">', unsafe_allow_html=True)
 
@@ -856,9 +842,9 @@ def main():
 
         products = st.session_state.get("last_products") or []
         if not products:
+            # UPDATED: plain text, no chat-card box
             st.markdown(
-                "<div class='chat-card'>No products yet. Ask a question or upload an image to see matches here.</div>",
-                unsafe_allow_html=True,
+                "No products yet. Ask a question or upload an image to see matches here."
             )
         else:
             st.markdown(
@@ -887,11 +873,10 @@ def main():
                         )
                     st.markdown("---")
 
-        st.markdown("</div>", unsafe_allow_html=True)  # right-panel
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)  # main-container
+    st.markdown("</div>", unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
     main()
-
