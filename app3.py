@@ -573,7 +573,7 @@ def main():
         .main-container {
             max-width: 1200px;
             margin: 0 auto;
-            padding-bottom: 2rem;
+            padding-bottom: 3rem;
         }
         .amazon-header {
             background-color: #131921;
@@ -676,8 +676,8 @@ def main():
     st.markdown(
         """
         <div class="amazon-header">
-            <div class="amazon-logo">Store Chatbot</div>
-            <div class="amazon-tagline">-Product Q&A assistant powered by hybrid search</div>
+            <div class="amazon-logo">store.chat</div>
+            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -718,16 +718,18 @@ def main():
     if "last_products" not in st.session_state:
         st.session_state["last_products"] = None
 
+    messages = st.session_state["messages"]
+    last_products = st.session_state["last_products"]
+
     # Layout: chat (left) + product results (right)
     col_main, col_right = st.columns([2.1, 1.2])
 
-    # LEFT: CHAT
+    # LEFT: CHAT HISTORY
     with col_main:
         st.markdown('<div class="left-panel">', unsafe_allow_html=True)
-
         st.subheader("Chat with your product assistant")
 
-        for msg in st.session_state["messages"]:
+        for i, msg in enumerate(messages):
             role = msg["role"]
             css_class = "assistant-bubble" if role == "assistant" else "user-bubble"
             with st.chat_message(role):
@@ -735,97 +737,22 @@ def main():
                     f'<div class="chat-card {css_class}">{msg["content"]}</div>',
                     unsafe_allow_html=True,
                 )
-
-        uploaded_file = st.file_uploader(
-            "Upload a product image (optional)",
-            type=["png", "jpg", "jpeg"],
-            key="image_uploader",
-        )
-
-        use_image = st.checkbox(
-            "Use uploaded image for this question",
-            value=(uploaded_file is not None),
-            help="Uncheck to ignore the image and run a text-only search.",
-        )
-
-        user_input = st.chat_input(
-            "Ask about a product (e.g., 'What is this product and how do I use it?')"
-        )
-
-        if user_input:
-            # Show user message
-            with st.chat_message("user"):
-                content_html = f'<div class="chat-card user-bubble">{user_input}</div>'
-                st.markdown(content_html, unsafe_allow_html=True)
-                if uploaded_file is not None and use_image:
-                    st.image(uploaded_file, caption="Uploaded image", width=220)
-
-            st.session_state["messages"].append(
-                {"role": "user", "content": user_input}
-            )
-
-            # Build query image
-            query_image = None
-            if uploaded_file is not None and use_image:
-                image_bytes = uploaded_file.getvalue()
-                query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-
-            # Run RAG
-            try:
-                response = rag_query(
-                    backend=backend,
-                    query_text=user_input.strip() or None,
-                    query_image=query_image,
-                    top_k=top_k,
-                    return_mode=return_mode,
-                )
-            except ValueError as e:
-                with st.chat_message("assistant"):
-                    st.error(str(e))
-                st.session_state["messages"].append(
-                    {"role": "assistant", "content": f"Error: {e}"}
-                )
-                st.markdown("</div>", unsafe_allow_html=True)
-                st.markdown("</div>", unsafe_allow_html=True)
-                return
-
-            # Show assistant answer (top product only) + top product image
-            with st.chat_message("assistant"):
-                if response.answer:
-                    ans_html = (
-                        f'<div class="chat-card assistant-bubble">{response.answer}</div>'
-                    )
-                    st.markdown(ans_html, unsafe_allow_html=True)
-                    answer_text_for_history = response.answer
-
-                    # Show top product image under the answer
-                    if response.products:
-                        top_entity = response.products[0]["entity"]
-                        img_url = top_entity.get("image_url")
-                        if img_url:
-                            st.image(
-                                img_url,
-                                caption=top_entity.get("product_name", "Top product"),
-                                width=220,
-                            )
-                else:
-                    if not response.products:
-                        answer_text_for_history = (
-                            "I couldn't find any matching products for your query."
+                # For the LAST assistant message, show top product image
+                if (
+                    role == "assistant"
+                    and i == len(messages) - 1
+                    and last_products
+                    and isinstance(last_products, list)
+                    and len(last_products) > 0
+                ):
+                    top_entity = last_products[0]["entity"]
+                    img_url = top_entity.get("image_url")
+                    if img_url:
+                        st.image(
+                            img_url,
+                            caption=top_entity.get("product_name", "Top product"),
+                            width=220,
                         )
-                    else:
-                        answer_text_for_history = (
-                            "I retrieved some products matching your query (generation is disabled)."
-                        )
-                    ans_html = (
-                        f'<div class="chat-card assistant-bubble">{answer_text_for_history}</div>'
-                    )
-                    st.markdown(ans_html, unsafe_allow_html=True)
-
-            st.session_state["messages"].append(
-                {"role": "assistant", "content": answer_text_for_history}
-            )
-            st.session_state["last_products"] = response.products
 
         st.markdown("</div>", unsafe_allow_html=True)
 
@@ -833,9 +760,9 @@ def main():
     with col_right:
         st.markdown('<div class="right-panel">', unsafe_allow_html=True)
 
-        st.subheader("Recommended Products")
+        st.subheader("Matching products")
 
-        products = st.session_state.get("last_products") or []
+        products = last_products or []
         if not products:
             st.markdown(
                 "No products yet. Ask a question or upload an image to see matches here."
@@ -845,7 +772,7 @@ def main():
                 "<div class='product-panel-title'>Top results</div>",
                 unsafe_allow_html=True,
             )
-            # Show ALL retrieved products, ranked by relevance score
+            # Show ALL retrieved products, ranked by relevance
             for p in products:
                 render_product_card(p["entity"], p["score"])
 
@@ -870,9 +797,81 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    st.markdown("</div>", unsafe_allow_html=True)
+    # -------------------------------------------------------------------------
+    # BOTTOM INPUT AREA: always rendered last so chatbox stays at the bottom
+    # -------------------------------------------------------------------------
+    st.markdown("---")
+
+    uploaded_file = st.file_uploader(
+        "Upload a product image (optional)",
+        type=["png", "jpg", "jpeg"],
+        key="image_uploader",
+    )
+
+    use_image = st.checkbox(
+        "Use uploaded image for this question",
+        value=(uploaded_file is not None),
+        help="Uncheck to ignore the image and run a text-only search.",
+    )
+
+    user_input = st.chat_input(
+        "Ask about a product (e.g., 'What is this product and how do I use it?')"
+    )
+
+    if user_input:
+        # Build query image
+        query_image = None
+        if uploaded_file is not None and use_image:
+            image_bytes = uploaded_file.getvalue()
+            query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+
+        # Run RAG
+        try:
+            response = rag_query(
+                backend=backend,
+                query_text=user_input.strip() or None,
+                query_image=query_image,
+                top_k=top_k,
+                return_mode=return_mode,
+            )
+        except ValueError as e:
+            st.error(str(e))
+            # Log error as assistant message
+            st.session_state["messages"].append(
+                {"role": "assistant", "content": f"Error: {e}"}
+            )
+            st.rerun()
+
+        # Update chat history (user + assistant)
+        st.session_state["messages"].append(
+            {"role": "user", "content": user_input}
+        )
+
+        if response.answer:
+            answer_text_for_history = response.answer
+        else:
+            if not response.products:
+                answer_text_for_history = (
+                    "I couldn't find any matching products for your query."
+                )
+            else:
+                answer_text_for_history = (
+                    "I retrieved some products matching your query (generation is disabled)."
+                )
+
+        st.session_state["messages"].append(
+            {"role": "assistant", "content": answer_text_for_history}
+        )
+
+        # Save retrieved products for right panel + last answer image
+        st.session_state["last_products"] = response.products
+
+        # Rerun so new messages show in the history above,
+        # while the chat input stays at the bottom.
+        st.rerun()
+
+    st.markdown("</div>", unsafe_allow_html=True)  # main-container end
 
 
 if __name__ == "__main__":
     main()
-
