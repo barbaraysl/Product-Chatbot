@@ -557,7 +557,6 @@ def render_product_card(entity: Dict, score: float):
         unsafe_allow_html=True,
     )
     if img_url:
-        # Explicit width (no use_column_width)
         st.image(img_url, width=180)
     else:
         st.markdown(
@@ -584,12 +583,12 @@ def render_product_card(entity: Dict, score: float):
 def main():
     backend = init_backend()
 
-    # --- Amazon-like CSS theme ---
+    # --- CSS theme (flattened: all white background, no visible top bars) ---
     st.markdown(
         """
         <style>
         .stApp {
-            background-color: #f3f3f3;
+            background-color: #ffffff;  /* whole app white */
         }
         .main-container {
             max-width: 1200px;
@@ -615,12 +614,13 @@ def main():
             font-size: 0.9rem;
             opacity: 0.85;
         }
-        .left-panel {
-            background-color: #ffffff;         /* chat section now white */
-            border-radius: 8px;
-            padding: 0.8rem 0.9rem 1.2rem 0.9rem;
-            box-shadow: 0 1px 3px rgba(15,17,17,0.15);
-            margin-bottom: 1rem;
+        /* make panel wrappers transparent so they don't show as bars */
+        .left-panel, .right-panel {
+            background-color: transparent;
+            border-radius: 0;
+            padding: 0;
+            box-shadow: none;
+            margin-bottom: 0.5rem;
         }
         .chat-card {
             background-color: #ffffff;
@@ -638,12 +638,6 @@ def main():
         .product-panel-title {
             font-weight: 600;
             margin-bottom: 0.4rem;
-        }
-        .right-panel {
-            background-color: #ffffff; /* entire right side white */
-            border-radius: 8px;
-            padding: 0.8rem 0.8rem 1rem 0.8rem;
-            box-shadow: 0 1px 3px rgba(15,17,17,0.15);
         }
         .product-card {
             background-color: #ffffff;
@@ -700,7 +694,7 @@ def main():
         unsafe_allow_html=True,
     )
 
-    # top "Amazon" header
+    # top header
     st.markdown(
         """
         <div class="amazon-header">
@@ -733,7 +727,6 @@ def main():
         if st.button("🧹 Start new chat"):
             st.session_state["messages"] = []
             st.session_state["last_products"] = None
-            # FIX: use st.rerun() instead of deprecated experimental_rerun
             st.rerun()
 
         st.markdown("### Backend")
@@ -756,7 +749,7 @@ def main():
 
         st.subheader("Chat with your product assistant")
 
-        # Show history (wrapped in card look)
+        # Show history
         for msg in st.session_state["messages"]:
             role = msg["role"]
             css_class = "assistant-bubble" if role == "assistant" else "user-bubble"
@@ -820,8 +813,8 @@ def main():
                 st.session_state["messages"].append(
                     {"role": "assistant", "content": f"Error: {e}"}
                 )
-                st.markdown("</div>", unsafe_allow_html=True)  # close left-panel
-                st.markdown("</div>", unsafe_allow_html=True)  # close main-container
+                st.markdown("</div>", unsafe_allow_html=True)  # left-panel
+                st.markdown("</div>", unsafe_allow_html=True)  # main-container
                 return
 
             # Assistant message
@@ -853,7 +846,7 @@ def main():
             # Save last products for the right panel
             st.session_state["last_products"] = response.products
 
-        st.markdown("</div>", unsafe_allow_html=True)  # close left-panel
+        st.markdown("</div>", unsafe_allow_html=True)  # left-panel
 
     # ------------------ RIGHT: PRODUCT PANEL ------------------
     with col_right:
@@ -872,11 +865,9 @@ def main():
                 "<div class='product-panel-title'>Top results</div>",
                 unsafe_allow_html=True,
             )
-            # Show up to 4 product cards
             for p in products[:4]:
                 render_product_card(p["entity"], p["score"])
 
-            # Optional debug view
             with st.expander("Debug: raw product list"):
                 for i, p in enumerate(products, start=1):
                     e = p["entity"]
@@ -896,9 +887,9 @@ def main():
                         )
                     st.markdown("---")
 
-        st.markdown("</div>", unsafe_allow_html=True)  # close right-panel
+        st.markdown("</div>", unsafe_allow_html=True)  # right-panel
 
-    st.markdown("</div>", unsafe_allow_html=True)  # close main-container
+    st.markdown("</div>", unsafe_allow_html=True)  # main-container
 
 
 if __name__ == "__main__":
