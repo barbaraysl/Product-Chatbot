@@ -698,8 +698,8 @@ def main():
     st.markdown(
         """
         <div class="amazon-header">
-            <div class="amazon-logo">store.chat</div>
-            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
+            <div class="amazon-logo">Product Chatbot</div>
+            <div class="amazon-tagline">-Q&A assistant powered by hybrid search</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -747,7 +747,7 @@ def main():
     with col_main:
         st.markdown('<div class="left-panel">', unsafe_allow_html=True)
 
-        st.subheader("Chat with your product assistant")
+        st.subheader("Chat with your Product Assistant")
 
         # Show history
         for msg in st.session_state["messages"]:
@@ -894,3 +894,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
