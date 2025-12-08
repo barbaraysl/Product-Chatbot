@@ -67,7 +67,7 @@ class Config:
 
     @classmethod
     def print_config(cls):
-        """Print current configuration."""
+        """Print current configuration (for debugging)."""
         print("Current Configuration:")
         print(f"  Milvus: {cls.MILVUS_URI or f'{cls.MILVUS_HOST}:{cls.MILVUS_PORT}'}")
         print(f"  Collection: {cls.COLLECTION_NAME}")
@@ -153,7 +153,6 @@ def convert_to_sparse_csr(dense_array: np.ndarray, top_k: int = 256) -> csr_matr
     """Convert dense array to scipy CSR sparse matrix (top-K dims)."""
     top_indices = np.argsort(dense_array)[-top_k:]
     top_values = dense_array[top_indices]
-
     n_cols = len(dense_array)
     sparse_matrix = csr_matrix(
         (top_values, (np.zeros(len(top_indices), dtype=int), top_indices)),
@@ -349,26 +348,8 @@ def retrieve_products(
 
 
 # =============================================================================
-# GENERATION
+# GENERATION (TOP PRODUCT ONLY)
 # =============================================================================
-def create_context_string(products: List[Dict]) -> str:
-    """Format products into context string for LLM."""
-    if not products:
-        return "No relevant products found."
-
-    context_parts = []
-    for i, product in enumerate(products, 1):
-        entity = product["entity"]
-        context_parts.append(
-            f"[Product {i}]\n"
-            f"Name: {entity.get('product_name')}\n"
-            f"Price: {entity.get('selling_price')}\n"
-            f"Description: {entity.get('about_product', 'N/A')[:300]}\n"
-            f"Image URL: {entity.get('image_url')}\n"
-        )
-    return "\n".join(context_parts)
-
-
 def create_query_description(
     query_text: Optional[str],
     query_image: Optional[Image.Image],
@@ -389,40 +370,52 @@ generation_prompt = ChatPromptTemplate.from_messages(
         (
             "system",
             """You are a helpful shopping assistant for an e-commerce platform.
-Your role is to recommend products based on the user's query and retrieved product information.
 
-Guidelines:
-- Be concise and helpful
-- Recommend products that best match the user's needs
-- Mention key features like price, description, and unique attributes
-- If multiple good options exist, explain the differences
-- If no good matches found, suggest alternatives or ask clarifying questions
-- Do NOT mention image URLs in your response (those are for display purposes)
-- Do NOT make up product information - only use what's provided in the context""",
+You will receive context for a single product labeled [Product 1].
+Always focus ONLY on this top product when answering.
+
+Your job:
+- Identify what the product is
+- Describe its main purpose and how to use it
+- Highlight key features, materials, options, or accessories
+- Keep the answer clear and concise (1–3 short paragraphs)
+
+Do NOT invent features that are not in the context.
+Do NOT mention other products or ranking/order.""",
         ),
         (
             "human",
             """User Query: {query_description}
 
-Retrieved Products:
+Top Retrieved Product:
 {context}
 
-Based on the above products, please provide helpful recommendations to the user.""",
+Based on this product only, answer the user's question and describe the product and its usage.""",
         ),
     ]
 )
 
 
-def generate_answer(
+def generate_answer_for_top_product(
     query_text: Optional[str],
     query_image: Optional[Image.Image],
     retrieved_products: List[Dict],
     backend: Dict,
 ) -> str:
-    """Generate answer text from retrieved products."""
-    context = create_context_string(retrieved_products)
-    query_description = create_query_description(query_text, query_image)
+    """Generate answer focusing only on the top retrieved product."""
+    if not retrieved_products:
+        return "I couldn't find any matching product for your query."
 
+    top_product = retrieved_products[0]["entity"]
+    context = (
+        f"[Product 1]\n"
+        f"Name: {top_product.get('product_name')}\n"
+        f"Price: {top_product.get('selling_price')}\n"
+        f"Description: {str(top_product.get('about_product', 'N/A'))[:400]}\n"
+        f"Image URL: {top_product.get('image_url')}\n"
+    )
+
+    query_description = create_query_description(query_text, query_image)
     llm: ChatOpenAI = backend["llm"]
     chain = generation_prompt | llm | StrOutputParser()
     answer = chain.invoke({"context": context, "query_description": query_description})
@@ -446,21 +439,6 @@ class RAGResponse:
         self.query_text = query_text
         self.query_image = query_image
 
-    def to_dict(self) -> dict:
-        return {
-            "answer": self.answer,
-            "products": [
-                {
-                    "product_name": p["entity"].get("product_name"),
-                    "price": p["entity"].get("selling_price"),
-                    "image_url": p["entity"].get("image_url"),
-                    "score": p["score"],
-                }
-                for p in self.products
-            ],
-            "query_type": self.query_type,
-        }
-
 
 def rag_query(
     backend: Dict,
@@ -469,7 +447,7 @@ def rag_query(
     top_k: int = None,
     return_mode: str = "full",
 ) -> RAGResponse:
-    """Complete RAG pipeline: retrieve + generate."""
+    """Complete RAG pipeline: retrieve + generate (or retrieval only)."""
     if not query_text and not query_image:
         raise ValueError("Must provide either query_text or query_image")
 
@@ -495,7 +473,9 @@ def rag_query(
 
     answer = None
     if return_mode == "full":
-        answer = generate_answer(query_text, query_image, products, backend)
+        answer = generate_answer_for_top_product(
+            query_text, query_image, products, backend
+        )
 
     return RAGResponse(
         answer=answer,
@@ -696,8 +676,8 @@ def main():
     st.markdown(
         """
         <div class="amazon-header">
-            <div class="amazon-logo">Store Chatbot</div>
-            <div class="amazon-tagline">-Product Q&A assistant powered by hybrid search</div>
+            <div class="amazon-logo">store.chat</div>
+            <div class="amazon-tagline">Product Q&A assistant powered by hybrid search</div>
         </div>
         """,
         unsafe_allow_html=True,
@@ -732,7 +712,7 @@ def main():
         st.write(f"Device: `{Config.DEVICE}`")
         st.write(f"LLM: `{Config.LLM_MODEL}`")
 
-    # State
+    # Session state
     if "messages" not in st.session_state:
         st.session_state["messages"] = []
     if "last_products" not in st.session_state:
@@ -773,6 +753,7 @@ def main():
         )
 
         if user_input:
+            # Show user message
             with st.chat_message("user"):
                 content_html = f'<div class="chat-card user-bubble">{user_input}</div>'
                 st.markdown(content_html, unsafe_allow_html=True)
@@ -783,11 +764,13 @@ def main():
                 {"role": "user", "content": user_input}
             )
 
+            # Build query image
             query_image = None
             if uploaded_file is not None and use_image:
                 image_bytes = uploaded_file.getvalue()
                 query_image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
+            # Run RAG
             try:
                 response = rag_query(
                     backend=backend,
@@ -806,6 +789,7 @@ def main():
                 st.markdown("</div>", unsafe_allow_html=True)
                 return
 
+            # Show assistant answer (top product only) + top product image
             with st.chat_message("assistant"):
                 if response.answer:
                     ans_html = (
@@ -813,6 +797,17 @@ def main():
                     )
                     st.markdown(ans_html, unsafe_allow_html=True)
                     answer_text_for_history = response.answer
+
+                    # Show top product image under the answer
+                    if response.products:
+                        top_entity = response.products[0]["entity"]
+                        img_url = top_entity.get("image_url")
+                        if img_url:
+                            st.image(
+                                img_url,
+                                caption=top_entity.get("product_name", "Top product"),
+                                width=220,
+                            )
                 else:
                     if not response.products:
                         answer_text_for_history = (
@@ -834,7 +829,7 @@ def main():
 
         st.markdown("</div>", unsafe_allow_html=True)
 
-    # RIGHT: PRODUCTS
+    # RIGHT: MATCHING PRODUCTS
     with col_right:
         st.markdown('<div class="right-panel">', unsafe_allow_html=True)
 
@@ -842,7 +837,6 @@ def main():
 
         products = st.session_state.get("last_products") or []
         if not products:
-            # UPDATED: plain text, no chat-card box
             st.markdown(
                 "No products yet. Ask a question or upload an image to see matches here."
             )
@@ -851,7 +845,8 @@ def main():
                 "<div class='product-panel-title'>Top results</div>",
                 unsafe_allow_html=True,
             )
-            for p in products[:4]:
+            # Show ALL retrieved products, ranked by relevance score
+            for p in products:
                 render_product_card(p["entity"], p["score"])
 
             with st.expander("Debug: raw product list"):
